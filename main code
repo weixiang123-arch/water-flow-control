@@ -1,25 +1,13 @@
-/*
-  PID Water Level Control (REAL CM, LEVEL FROM BOTTOM) + BOOST FAR / 3-SPEED NEAR
-  + SERIAL PLOTTER SIGNALS + POSITIVE DISTURBANCE MARKER
-  + OVERSHOOT REDUCTION IMPROVEMENTS:
-      (1) Integrate only when |error| is small (anti-windup for disturbances)
-      (2) Short "drain boost" right after disturbance detected (earlier cancellation)
-      (3) Slightly softer near-zone duty (optional but helps reduce hunting)
-  ---------------------------------------------------------------------------
-  Serial Plotter outputs:
-    Level, Setpoint, Error, PIDout, Fill, Drain, Disturb
-*/
-
 #define TRIG_PIN 11
 #define ECHO_PIN 10
 
 #define PUMP_DRAIN 8   // Pump 1: ACTIVE-LOW (drain)
 #define PUMP_FILL  9   // Pump 2: ACTIVE-HIGH (fill)
 
-// ✅ Empty-tank distance (sensor -> bottom)
+// Empty-tank distance (sensor -> bottom)
 const float TANK_HEIGHT_CM = 13.70;
 
-// ✅ Practical full limits from your test
+// Practical full limits from  test
 const float FULL_LEVEL_CM = 11.50;  // max usable water level (bottom->water)
 const float FULL_DIST_CM  = 2.50;   // if dist <= this, treat as FULL (protect sensor)
 
@@ -125,11 +113,11 @@ void readSetpointFromSerial() {
 
   if (val >= 0.0 && val <= FULL_LEVEL_CM) {
     setpointLevel_cm = val;
-    Serial.print("✅ Setpoint LEVEL updated to ");
+    Serial.print(" Setpoint LEVEL updated to ");
     Serial.print(setpointLevel_cm, 2);
     Serial.println(" cm (from bottom)");
   } else {
-    Serial.print("❌ Invalid setpoint (0..");
+    Serial.print(" Invalid setpoint (0..");
     Serial.print(FULL_LEVEL_CM, 2);
     Serial.println(" cm)");
   }
