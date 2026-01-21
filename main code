@@ -1,6 +1,5 @@
 #define TRIG_PIN 11
 #define ECHO_PIN 10
-
 #define PUMP_DRAIN 8   // Pump 1: ACTIVE-LOW (drain)
 #define PUMP_FILL  9   // Pump 2: ACTIVE-HIGH (fill)
 
