@@ -1,0 +1,340 @@
+/*
+  PID Water Level Control (REAL CM, LEVEL FROM BOTTOM) + BOOST FAR / 3-SPEED NEAR
+  + SERIAL PLOTTER SIGNALS + POSITIVE DISTURBANCE MARKER
+  + OVERSHOOT REDUCTION IMPROVEMENTS:
+      (1) Integrate only when |error| is small (anti-windup for disturbances)
+      (2) Short "drain boost" right after disturbance detected (earlier cancellation)
+      (3) Slightly softer near-zone duty (optional but helps reduce hunting)
+  ---------------------------------------------------------------------------
+  Serial Plotter outputs:
+    Level, Setpoint, Error, PIDout, Fill, Drain, Disturb
+*/
+
+#define TRIG_PIN 11
+#define ECHO_PIN 10
+
+#define PUMP_DRAIN 8   // Pump 1: ACTIVE-LOW (drain)
+#define PUMP_FILL  9   // Pump 2: ACTIVE-HIGH (fill)
+
+// ✅ Empty-tank distance (sensor -> bottom)
+const float TANK_HEIGHT_CM = 13.70;
+
+// ✅ Practical full limits from your test
+const float FULL_LEVEL_CM = 11.50;  // max usable water level (bottom->water)
+const float FULL_DIST_CM  = 2.50;   // if dist <= this, treat as FULL (protect sensor)
+
+// ---- Setpoint is WATER LEVEL from bottom (cm) ----
+float setpointLevel_cm = 9;       // target (0 .. FULL_LEVEL_CM)
+const float DEADBAND_CM = 0.30;     // deadband
+
+// ---- Adaptive sampling times ----
+const unsigned long FAST_SAMPLE = 500;
+const unsigned long SLOW_SAMPLE = 2000;
+unsigned long currentSampleTime = FAST_SAMPLE;
+unsigned long lastSampleTime = 0;
+
+// ---- Time-proportioning window (relay-friendly) ----
+const unsigned long WINDOW_MS = 2000;    // 2s window
+unsigned long windowStart = 0;
+
+// ---- Far/near behavior knob ----
+const float BOOST_ERR_CM = 1.0;          // >= 1cm => FULL ON (fast)
+
+// ---- 3-speed near-zone shaping ----
+const float VERY_NEAR_ERR_CM = 0.50;
+const float NEAR_ERR_CM      = 1.00;
+
+// Slightly softer near duties (helps reduce oscillation near SP)
+const float DUTY_VERY_NEAR = 0.07;   // was 0.10
+const float DUTY_NEAR      = 0.15;   // was 0.20
+const float DUTY_MID       = 0.25;   // was 0.35
+
+const unsigned long ON_VERY_NEAR_MS = 150;
+const unsigned long ON_NEAR_MS      = 250;
+const unsigned long ON_MID_MS       = 400;
+
+// ---- PID gains (tune these) ----
+float Kp = 2.0;
+float Ki = 0.03;
+float Kd = 3.0;
+
+// ---- PID state ----
+float integral = 0.0;
+float prevError = 0.0;
+unsigned long lastPIDTime = 0;
+
+// ===================== Disturbance detection (positive) =====================
+// sudden extra water => water level jumps UP
+const float POS_DISTURB_THRESH_CM = 0.80;  // tune 0.5~1.5 depending on noise/tank
+float prevLevel_cm_forDist = 0.0;
+bool prevLevelValid = false;
+int disturbPulse = 0; // 1 for one sample when disturbance detected
+
+// Disturbance drain boost (early cancellation)
+unsigned long disturbBoostUntil = 0;
+const unsigned long DISTURB_BOOST_MS = 1200; // 1.2s strong drain after disturb detect
+
+// ===================== For plotting pump states =====================
+int fillStatePlot = 0;   // 1 when fill pump ON
+int drainStatePlot = 0;  // 1 when drain pump ON
+
+// ---- Pump helpers ----
+void drainOn()  { digitalWrite(PUMP_DRAIN, LOW); drainStatePlot = 1; }   // ACTIVE-LOW
+void drainOff() { digitalWrite(PUMP_DRAIN, HIGH); drainStatePlot = 0; }
+
+void fillOn()   { digitalWrite(PUMP_FILL, HIGH); fillStatePlot = 1; }    // ACTIVE-HIGH
+void fillOff()  { digitalWrite(PUMP_FILL, LOW); fillStatePlot = 0; }
+
+// ---- Ultrasonic read (cm) ----
+float readDistanceCm() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  unsigned long duration = pulseIn(ECHO_PIN, HIGH, 30000); // timeout 30ms
+  if (duration == 0) return -1;
+
+  return (duration * 0.0343f) / 2.0f;
+}
+
+// ---- Averaging filter ----
+float filteredDistanceCm() {
+  const int N = 5;
+  float sum = 0;
+  int count = 0;
+
+  for (int i = 0; i < N; i++) {
+    float d = readDistanceCm();
+    if (d > 0) { sum += d; count++; }
+    delay(25);
+  }
+  if (count == 0) return -1;
+  return sum / count;
+}
+
+// ---- Read setpoint from Serial (cm) ----
+// Type: 8.5 then Enter
+void readSetpointFromSerial() {
+  if (!Serial.available()) return;
+
+  String s = Serial.readStringUntil('\n');
+  s.trim();
+  float val = s.toFloat();
+
+  if (val >= 0.0 && val <= FULL_LEVEL_CM) {
+    setpointLevel_cm = val;
+    Serial.print("✅ Setpoint LEVEL updated to ");
+    Serial.print(setpointLevel_cm, 2);
+    Serial.println(" cm (from bottom)");
+  } else {
+    Serial.print("❌ Invalid setpoint (0..");
+    Serial.print(FULL_LEVEL_CM, 2);
+    Serial.println(" cm)");
+  }
+}
+
+// ---- PID compute (anti-windup improved) ----
+float computePID(float error) {
+  unsigned long now = millis();
+  float dt = (now - lastPIDTime) / 1000.0f;
+  if (dt <= 0) dt = 0.001f;
+
+  // Reset integral if error sign changes (crossing setpoint)
+  if ((error > 0 && prevError < 0) || (error < 0 && prevError > 0)) {
+    integral = 0.0f;
+  }
+
+  float derivative = (error - prevError) / dt;
+
+  // Anti-windup: integrate only when close-ish to setpoint
+  // This avoids big integral buildup during sudden disturbances (reduces overshoot)
+  if (abs(error) > DEADBAND_CM && abs(error) < 1.0f) {
+    integral += error * dt;
+  }
+
+  // Clamp integral
+  const float I_LIMIT = 20.0f;
+  if (integral > I_LIMIT) integral = I_LIMIT;
+  if (integral < -I_LIMIT) integral = -I_LIMIT;
+
+  float out = (Kp * error) + (Ki * integral) + (Kd * derivative);
+
+  prevError = error;
+  lastPIDTime = now;
+  return out;
+}
+
+// ---- Apply control to pumps (BOOST FAR / 3-SPEED NEAR) ----
+void applyControl(float error, float pidOut, bool forceFillOff) {
+  // Deadband => stop
+  if (abs(error) <= DEADBAND_CM) {
+    drainOff();
+    fillOff();
+    return;
+  }
+
+  bool needFill  = (error > 0); // level too low
+  bool needDrain = (error < 0); // level too high
+
+  // Safety: if full by distance, never allow fill
+  if (forceFillOff && needFill) {
+    fillOff();
+    drainOff();
+    return;
+  }
+
+  unsigned long now = millis();
+  if (now - windowStart >= WINDOW_MS) windowStart = now;
+
+  // Disturbance boost: after positive disturbance detected, drain strongly for a short time
+  if (now < disturbBoostUntil && needDrain) {
+    fillOff();
+    drainOn();
+    return;
+  }
+
+  // BOOST: far from setpoint => full ON
+  if (abs(error) >= BOOST_ERR_CM) {
+    if (needFill) {
+      drainOff();
+      fillOn();
+    } else if (needDrain) {
+      fillOff();
+      drainOn();
+    }
+    return;
+  }
+
+  // NEAR: 3-speed shaping + PID magnitude contribution
+  float e = abs(error);
+
+  float baseDuty;
+  unsigned long minOn;
+
+  if (e <= VERY_NEAR_ERR_CM) {
+    baseDuty = DUTY_VERY_NEAR;
+    minOn    = ON_VERY_NEAR_MS;
+  } else if (e <= NEAR_ERR_CM) {
+    baseDuty = DUTY_NEAR;
+    minOn    = ON_NEAR_MS;
+  } else {
+    baseDuty = DUTY_MID;
+    minOn    = ON_MID_MS;
+  }
+
+  float mag = abs(pidOut);
+  if (mag > 100.0f) mag = 100.0f;
+  float pidDuty = mag / 100.0f;
+
+  float duty = pidDuty;
+  if (duty < baseDuty) duty = baseDuty;
+  if (duty > 1.0f) duty = 1.0f;
+
+  unsigned long onTime = (unsigned long)(WINDOW_MS * duty);
+  if (onTime < minOn) onTime = minOn;
+  if (onTime > WINDOW_MS) onTime = WINDOW_MS;
+
+  bool shouldBeOn = (now - windowStart) < onTime;
+
+  if (needFill) {
+    drainOff();
+    if (shouldBeOn) fillOn(); else fillOff();
+  } else if (needDrain) {
+    fillOff();
+    if (shouldBeOn) drainOn(); else drainOff();
+  }
+}
+
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  pinMode(PUMP_DRAIN, OUTPUT);
+  pinMode(PUMP_FILL, OUTPUT);
+
+  drainOff();
+  fillOff();
+
+  lastSampleTime = millis();
+  lastPIDTime = millis();
+  windowStart = millis();
+
+  Serial.println("Open Tools > Serial Plotter. Plot: Level Setpoint Error PIDout Fill Drain Disturb");
+  Serial.println("Type new setpoint (cm) then Enter. Pour extra water to create +disturbance.");
+}
+
+void loop() {
+  readSetpointFromSerial();
+
+  unsigned long now = millis();
+  if (now - lastSampleTime < currentSampleTime) return;
+  lastSampleTime = now;
+
+  // reset disturbance pulse each cycle (one-sample marker)
+  disturbPulse = 0;
+
+  float dist_cm = filteredDistanceCm();
+  if (dist_cm < 0) {
+    drainOff();
+    fillOff();
+
+    // Plotter-friendly output even on error
+    Serial.print("Level:");     Serial.print(0.0, 2);
+    Serial.print(" Setpoint:"); Serial.print(setpointLevel_cm, 2);
+    Serial.print(" Error:");    Serial.print(0.0, 2);
+    Serial.print(" PIDout:");   Serial.print(0.0, 2);
+    Serial.print(" Fill:");     Serial.print(fillStatePlot);
+    Serial.print(" Drain:");    Serial.print(drainStatePlot);
+    Serial.print(" Disturb:");  Serial.println(0);
+
+    currentSampleTime = FAST_SAMPLE;
+    return;
+  }
+
+  bool isFullByDistance = (dist_cm <= FULL_DIST_CM);
+
+  float level_cm = TANK_HEIGHT_CM - dist_cm;
+
+  // Clamp level to [0, FULL_LEVEL_CM]
+  if (level_cm < 0) level_cm = 0;
+  if (level_cm > FULL_LEVEL_CM) level_cm = FULL_LEVEL_CM;
+
+  // Clamp setpoint too
+  if (setpointLevel_cm < 0) setpointLevel_cm = 0;
+  if (setpointLevel_cm > FULL_LEVEL_CM) setpointLevel_cm = FULL_LEVEL_CM;
+
+  // ---- Positive disturbance detection ----
+  if (prevLevelValid) {
+    float jump = level_cm - prevLevel_cm_forDist; // + jump means water level increased
+    if (jump >= POS_DISTURB_THRESH_CM) {
+      disturbPulse = 1; // mark disturbance (one sample)
+
+      // Start drain-boost window (helps reduce overshoot peak)
+      disturbBoostUntil = millis() + DISTURB_BOOST_MS;
+    }
+  }
+  prevLevel_cm_forDist = level_cm;
+  prevLevelValid = true;
+
+  float error = setpointLevel_cm - level_cm;
+
+  // Adaptive sampling
+  currentSampleTime = (abs(error) <= DEADBAND_CM) ? SLOW_SAMPLE : FAST_SAMPLE;
+
+  float pidOut = computePID(error);
+
+  applyControl(error, pidOut, isFullByDistance);
+
+  // ===================== SERIAL PLOTTER OUTPUT =====================
+  Serial.print("Level:");     Serial.print(level_cm, 2);
+  Serial.print(" Setpoint:"); Serial.print(setpointLevel_cm, 2);
+  Serial.print(" Error:");    Serial.print(error, 2);
+  Serial.print(" PIDout:");   Serial.print(pidOut, 2);
+  Serial.print(" Fill:");     Serial.print(fillStatePlot);
+  Serial.print(" Drain:");    Serial.print(drainStatePlot);
+  Serial.print(" Disturb:");  Serial.println(disturbPulse);
+}
